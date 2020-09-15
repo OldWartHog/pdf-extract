@@ -16,7 +16,7 @@ use std::fmt;
 use std::str;
 use std::fs::File;
 use std::slice::Iter;
-use std::collections::HashMap;
+use std::collections::{HashMap, BTreeMap};
 use std::collections::hash_map::Entry;
 use std::rc::Rc;
 use std::marker::PhantomData;
@@ -1631,6 +1631,7 @@ impl<'a> Processor<'a> {
                     let resources = maybe_get_obj(&doc, &xf.dict, b"Resources").and_then(|n| n.as_dict().ok()).unwrap_or(resources);
                     let contents = get_contents(xf);
                     self.process_stream(&doc, contents, resources, &media_box, output, page_num)?;
+                    output.end_stream()?;
                 }
                 _ => { dlog!("unknown operation {:?}", operation); }
 
@@ -1643,6 +1644,7 @@ impl<'a> Processor<'a> {
 
 pub trait OutputDev {
     fn begin_page(&mut self, page_num: u32, media_box: &MediaBox, art_box: Option<(f64, f64, f64, f64)>)-> Result<(), OutputError>;
+    fn end_stream(&mut self)-> Result<(), OutputError> { Ok(()) }
     fn end_page(&mut self)-> Result<(), OutputError>;
     fn output_character(&mut self, trm: &Transform, width: f64, spacing: f64, font_size: f64, char: &str) -> Result<(), OutputError>;
     fn begin_word(&mut self)-> Result<(), OutputError>;
@@ -2030,4 +2032,170 @@ pub fn output_doc(doc: &Document, output: &mut dyn OutputDev) -> Result<(), Outp
         output.end_page()?;
     }
     Ok(())
+}
+
+/// To hold strings in page position until stream is completed.
+///
+pub struct PositionMap {
+    tree : BTreeMap<i32, BTreeMap<i32, String>>,
+}
+
+impl PositionMap {
+    fn new() -> PositionMap {
+        PositionMap {
+            tree: BTreeMap::new(),
+        }
+    }
+    fn insert(&mut self, x: f64, y: f64, chars: &str) {
+        let yi = y.round() as i32;
+        let xi = x.round() as i32;
+        let line_tree = self.tree.entry(yi).or_insert(BTreeMap::new());
+        let entry = line_tree.entry(xi).or_insert("".to_string());
+        *entry += chars;
+        // println!("at ({}, {}): {}", yi.to_string(), xi.to_string(), chars);
+    }
+
+    pub fn enumerate_strings(&mut self, f: fn(&str) -> (), separator: Option<String>) {
+        let sep = separator.unwrap_or(", ".to_string());
+        for (_, value) in &self.tree {
+            let mut string = String::new();
+            // string.push_str(&value.len().to_string());
+            let mut first = true;
+            for (_, chars) in value {
+                if first {
+                    first = false;
+                } else {
+                    string.push_str(&sep);
+                }
+                string.push_str(&chars);
+            }
+            f(&string);
+        }
+    }
+
+    pub fn get_strings(&mut self, separator: Option<String>) -> Vec<String> {
+        let sep = separator.unwrap_or(", ".to_string());
+        let mut vec = Vec::new();
+        for (_, value) in &self.tree {
+            let mut string = String::new();
+            let mut first = true;
+            for (x, chars) in value {
+                if first {
+                    first = false;
+                    if *x > 100 {
+                        string.push_str(&sep);
+                    }
+                } else {
+                    string.push_str(&sep);
+                }
+                string.push_str(&chars);
+            }
+            vec.push(string);
+        }
+        vec
+    }
+
+    pub fn clear(&mut self) { self.tree.clear(); }
+}
+
+/// Don't think of this as a spreadsheet, think of it as text with tab separated fields.
+/// It outputs text in the order it physically appears on the page rather than the order it is written
+/// in the original pdf.  Sometimes this is better, sometimes not, depends how the pdf was constructed.
+/// This works well when content is basically one column in chaotic order, it works badly
+/// on streams with multi-column content because the columns get mushed together.
+pub struct CsvOutput<W: ConvertToFmt>   {
+    writer: W::Writer,
+    map: PositionMap,
+    accum: String,
+    last_end: f64,
+    last_y: f64,
+    first_x: f64,
+    flip_ctm: Transform,
+}
+
+impl<W: ConvertToFmt> CsvOutput<W> {
+    pub fn new(writer: W) -> CsvOutput<W> {
+        CsvOutput {
+            writer: writer.convert(),
+            map: PositionMap::new(),
+            accum: String::from(""),
+            last_end: 100000.,
+            last_y: 0.0,
+            first_x: 100000.,
+            flip_ctm: Transform2D::identity(),
+        }
+    }
+
+    fn flush_accum(&mut self) {
+        if !self.accum.is_empty() {
+            self.map.insert(self.first_x, self.last_y, &self.accum);
+            self.accum.clear();
+        }
+    }
+}
+impl<W: ConvertToFmt> OutputDev for CsvOutput<W> {
+    fn begin_page(&mut self, _page_num: u32, media_box: &MediaBox, _: Option<ArtBox>) -> Result<(), OutputError> {
+        self.flip_ctm = Transform2D::row_major(1., 0., 0., -1., 0., media_box.ury - media_box.lly);
+        if !self.accum.is_empty() {
+            self.flush_accum();
+        }
+        Ok(())
+    }
+    fn end_page(&mut self) -> Result<(), OutputError> {
+        if !self.accum.is_empty() {
+            self.flush_accum();
+        }
+
+        use std::fmt::Write;
+        let strings = self.map.get_strings(Some("\t".to_string()));
+        for s in strings {
+            write!(self.writer, "{}", s)?;
+            write!(self.writer, "\n")?;
+        }
+        self.map.clear();
+        Ok(())
+    }
+    fn end_stream(&mut self) -> Result<(), OutputError> { self.end_page() }
+
+    fn output_character(&mut self, trm: &Transform, width: f64, _spacing: f64, font_size: f64, char: &str) -> Result<(), OutputError> {
+        let position = trm.post_transform(&self.flip_ctm);
+        let transformed_font_size_vec = trm.transform_vector(vec2(font_size, font_size));
+        // get the length of one sized of the square with the same area with a rectangle of size (x, y)
+        let transformed_font_size = (transformed_font_size_vec.x*transformed_font_size_vec.y).sqrt();
+        let (x, y) = (position.m31, position.m32);
+
+        if (y - self.last_y).abs() > transformed_font_size * 1.5 {
+            self.flush_accum();
+        }
+
+        // we've moved to the left and down
+        if x < self.last_end && (y - self.last_y).abs() > transformed_font_size * 0.5 {
+            self.flush_accum();
+        }
+
+        if x > self.last_end + transformed_font_size * 5.0 {
+            self.flush_accum();
+        }
+
+        if self.accum.is_empty() {
+            self.first_x = x;
+        } else if x > self.last_end + transformed_font_size * 0.1 {
+            self.accum.push_str(" ");
+        }
+        // }
+        //let norm = unicode_normalization::UnicodeNormalization::nfkc(char);
+        self.accum.push_str(char);
+        self.last_y = y;
+        self.last_end = x + width * transformed_font_size;
+        Ok(())
+    }
+    fn begin_word(&mut self) -> Result<(), OutputError> {
+        Ok(())
+    }
+    fn end_word(&mut self) -> Result<(), OutputError> {
+        Ok(())
+    }
+    fn end_line(&mut self) -> Result<(), OutputError>{
+        Ok(())
+    }
 }

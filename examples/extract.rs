@@ -30,6 +30,7 @@ fn main() {
         "txt" => Box::new(PlainTextOutput::new(&mut output_file as &mut dyn std::io::Write)),
         "html" => Box::new(HTMLOutput::new(&mut output_file)),
         "svg" => Box::new(SVGOutput::new(&mut output_file)),
+        "csv" => Box::new(CsvOutput::new(&mut output_file as &mut dyn std::io::Write)),
         _ => panic!(),
     };
 
